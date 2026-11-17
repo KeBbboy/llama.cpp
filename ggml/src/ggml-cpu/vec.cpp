@@ -157,6 +157,9 @@ void ggml_vec_dot_bf16_f32(int n, float * GGML_RESTRICT s, size_t bs, const ggml
         c1 = _mm512_fmadd_ps(LOAD(x + i),      _mm512_loadu_ps(y + i),      c1);
         c2 = _mm512_fmadd_ps(LOAD(x + i + 16), _mm512_loadu_ps(y + i + 16), c2);
     }
+    for (; i + 16 <= n; i += 16) {
+        c1 = _mm512_fmadd_ps(LOAD(x + i), _mm512_loadu_ps(y + i), c1);
+    }
     sumf += (ggml_float)_mm512_reduce_add_ps(_mm512_add_ps(c1, c2));
 
 #undef LOAD
@@ -175,6 +178,9 @@ void ggml_vec_dot_bf16_f32(int n, float * GGML_RESTRICT s, size_t bs, const ggml
         c2 = GGML_F32x8_FMA(c2, LOAD(x + i + 8),  _mm256_loadu_ps(y + i + 8));
         c3 = GGML_F32x8_FMA(c3, LOAD(x + i + 16), _mm256_loadu_ps(y + i + 16));
         c4 = GGML_F32x8_FMA(c4, LOAD(x + i + 24), _mm256_loadu_ps(y + i + 24));
+    }
+    for (; i + 8 <= n; i += 8) {
+        c1 = GGML_F32x8_FMA(c1, LOAD(x + i), _mm256_loadu_ps(y + i));
     }
     __m128 g;
     c1 = _mm256_add_ps(_mm256_add_ps(c1, c3),
