@@ -136,37 +136,28 @@ void ggml_vec_dot_f32(int n, float * GGML_RESTRICT s, size_t bs, const float * G
     *s = sumf;
 }
 
-void ggml_vec_dot_bf16(int n, float * GGML_RESTRICT s, size_t bs, ggml_bf16_t * GGML_RESTRICT x, size_t bx, ggml_bf16_t * GGML_RESTRICT y, size_t by, int nrc) {
+void ggml_vec_dot_bf16_f32(int n, float * GGML_RESTRICT s, size_t bs, const ggml_bf16_t * GGML_RESTRICT x, size_t bx, const float * GGML_RESTRICT y, size_t by, int nrc) {
     assert(nrc == 1);
     GGML_UNUSED(nrc);
     GGML_UNUSED(bx);
     GGML_UNUSED(by);
     GGML_UNUSED(bs);
-    int i = 0;
+
     ggml_float sumf = 0;
+    int i = 0;
 
-#if defined(__AVX512BF16__)
-    __m512 c1 = _mm512_setzero_ps();
-    __m512 c2 = _mm512_setzero_ps();
-    for (; i + 64 <= n; i += 64) {
-        c1 = _mm512_dpbf16_ps(c1, m512bh(_mm512_loadu_si512((x + i))),
-                             m512bh(_mm512_loadu_si512((y + i))));
-        c2 = _mm512_dpbf16_ps(c2, m512bh(_mm512_loadu_si512((x + i + 32))),
-                             m512bh(_mm512_loadu_si512((y + i + 32))));
-    }
-    sumf += (ggml_float)_mm512_reduce_add_ps(c1);
-    sumf += (ggml_float)_mm512_reduce_add_ps(c2);
-
-#elif defined(__AVX512F__)
+    // x (BF16) is widened to F32 in-register and accumulated with F32 FMAs, y is already F32
+    // note: the AVX512-BF16 dpbf16 path is not usable here - it requires both operands in BF16,
+    //       so keeping src1 in F32 trades its 2x throughput for range and precision
+#if defined(__AVX512F__)
 #define LOAD(p) _mm512_castsi512_ps(_mm512_slli_epi32(_mm512_cvtepu16_epi32(_mm256_loadu_si256((const __m256i *)(p))), 16))
     __m512 c1 = _mm512_setzero_ps();
     __m512 c2 = _mm512_setzero_ps();
     for (; i + 32 <= n; i += 32) {
-        c1 = _mm512_add_ps(_mm512_mul_ps(LOAD(x + i), LOAD(y + i)), c1);
-        c2 = _mm512_add_ps(_mm512_mul_ps(LOAD(x + i + 16), LOAD(y + i + 16)), c2);
+        c1 = _mm512_fmadd_ps(LOAD(x + i),      _mm512_loadu_ps(y + i),      c1);
+        c2 = _mm512_fmadd_ps(LOAD(x + i + 16), _mm512_loadu_ps(y + i + 16), c2);
     }
-    sumf += (ggml_float)_mm512_reduce_add_ps(c1);
-    sumf += (ggml_float)_mm512_reduce_add_ps(c2);
+    sumf += (ggml_float)_mm512_reduce_add_ps(_mm512_add_ps(c1, c2));
 
 #undef LOAD
 #elif defined(__AVX2__) || defined(__AVX__)
@@ -180,10 +171,10 @@ void ggml_vec_dot_bf16(int n, float * GGML_RESTRICT s, size_t bs, ggml_bf16_t * 
     __m256 c3 = _mm256_setzero_ps();
     __m256 c4 = _mm256_setzero_ps();
     for (; i + 32 <= n; i += 32) {
-        c1 = _mm256_add_ps(_mm256_mul_ps(LOAD(x + i), LOAD(y + i)), c1);
-        c2 = _mm256_add_ps(_mm256_mul_ps(LOAD(x + i + 8), LOAD(y + i + 8)), c2);
-        c3 = _mm256_add_ps(_mm256_mul_ps(LOAD(x + i + 16), LOAD(y + i + 16)), c3);
-        c4 = _mm256_add_ps(_mm256_mul_ps(LOAD(x + i + 24), LOAD(y + i + 24)), c4);
+        c1 = GGML_F32x8_FMA(c1, LOAD(x + i),      _mm256_loadu_ps(y + i));
+        c2 = GGML_F32x8_FMA(c2, LOAD(x + i + 8),  _mm256_loadu_ps(y + i + 8));
+        c3 = GGML_F32x8_FMA(c3, LOAD(x + i + 16), _mm256_loadu_ps(y + i + 16));
+        c4 = GGML_F32x8_FMA(c4, LOAD(x + i + 24), _mm256_loadu_ps(y + i + 24));
     }
     __m128 g;
     c1 = _mm256_add_ps(_mm256_add_ps(c1, c3),
@@ -195,68 +186,23 @@ void ggml_vec_dot_bf16(int n, float * GGML_RESTRICT s, size_t bs, ggml_bf16_t * 
     sumf += (ggml_float)_mm_cvtss_f32(g);
 
 #undef LOAD
-#elif defined(__riscv_v) && defined(__riscv_zvfbfwma)
-    size_t vl = __riscv_vsetvlmax_e32m4();
-
-    // initialize accumulators to all zeroes
-    vfloat32m4_t vsum0 = __riscv_vfmv_v_f_f32m4(0.0f, vl);
-    vfloat32m4_t vsum1 = __riscv_vfmv_v_f_f32m4(0.0f, vl);
-
-    // calculate step size
-    const size_t epr = __riscv_vsetvlmax_e16m2();
-    const size_t step = epr * 2;
-    const int np = (n & ~(step - 1));
-
-    // unroll by 2
-    for (; i < np; i += step) {
-        vbfloat16m2_t ax0 = __riscv_vle16_v_bf16m2((const __bf16 *)&x[i], epr);
-        vbfloat16m2_t ay0 = __riscv_vle16_v_bf16m2((const __bf16 *)&y[i], epr);
-        vsum0 = __riscv_vfwmaccbf16_vv_f32m4(vsum0, ax0, ay0, epr);
-        __asm__ __volatile__ ("" ::: "memory");
-
-        vbfloat16m2_t ax1 = __riscv_vle16_v_bf16m2((const __bf16 *)&x[i + epr], epr);
-        vbfloat16m2_t ay1 = __riscv_vle16_v_bf16m2((const __bf16 *)&y[i + epr], epr);
-        vsum1 = __riscv_vfwmaccbf16_vv_f32m4(vsum1, ax1, ay1, epr);
-        __asm__ __volatile__ ("" ::: "memory");
-    }
-
-    // accumulate in 1 register
-    vsum0 = __riscv_vfadd_vv_f32m4(vsum0, vsum1, vl);
-
-    // leftovers
-    for (i = np; i < n; i += vl) {
-        vl = __riscv_vsetvl_e16m2(n - i);
-        vbfloat16m2_t ax0 = __riscv_vle16_v_bf16m2((const __bf16 *)&x[i], vl);
-        vbfloat16m2_t ay0 = __riscv_vle16_v_bf16m2((const __bf16 *)&y[i], vl);
-        vsum0 = __riscv_vfwmaccbf16_vv_f32m4(vsum0, ax0, ay0, vl);
-    }
-
-    // reduce
-    vl = __riscv_vsetvlmax_e32m4();
-    vfloat32m1_t redsum = __riscv_vfredusum_vs_f32m4_f32m1(vsum0, __riscv_vfmv_v_f_f32m1(0.0f, 1), vl);
-    sumf += __riscv_vfmv_f_s_f32m1_f32(redsum);
-
-#elif defined(__POWER9_VECTOR__) || defined(__VXE__) || defined(__VXE2__)
-    const int np = (n & ~(GGML_BF16_STEP - 1));
-    if (np > 0) {
-        GGML_F32_VEC sum[4] = {GGML_F32_VEC_ZERO};
-        for (; i < np; i += GGML_BF16_STEP) {
-            GGML_BF16_VEC vx0 = GGML_BF16_VEC_LOAD(x + i);
-            GGML_BF16_VEC vx1 = GGML_BF16_VEC_LOAD(x + i + 8);
-            GGML_BF16_VEC vy0 = GGML_BF16_VEC_LOAD(y + i);
-            GGML_BF16_VEC vy1 = GGML_BF16_VEC_LOAD(y + i + 8);
-            GGML_BF16_FMA_LO(sum[0], vx0, vy0);
-            GGML_BF16_FMA_HI(sum[1], vx0, vy0);
-            GGML_BF16_FMA_LO(sum[2], vx1, vy1);
-            GGML_BF16_FMA_HI(sum[3], vx1, vy1);
+#elif defined(GGML_SIMD)
+    // convert chunks of x to F32 and reuse the F32 SIMD dot
+    // TODO: widen BF16 to F32 in-register and fuse the dot (needs a new SIMD macro); also avoid the per-chunk call overhead for tiny k
+    float tx[64];
+    for (; i + 64 <= n; i += 64) {
+        const ggml_bf16_t * GGML_RESTRICT xr = x + i;
+        for (int j = 0; j < 64; ++j) {
+            tx[j] = GGML_BF16_TO_FP32(xr[j]);
         }
-        GGML_F32x4_REDUCE_4(sumf, sum[0], sum[1], sum[2], sum[3]);
+        float v;
+        ggml_vec_dot_f32(64, &v, 0, tx, 0, y + i, 0, 1);
+        sumf += v;
     }
 #endif
 
     for (; i < n; ++i) {
-        sumf += (ggml_float)(GGML_BF16_TO_FP32(x[i]) *
-                             GGML_BF16_TO_FP32(y[i]));
+        sumf += (ggml_float)(GGML_BF16_TO_FP32(x[i])*y[i]);
     }
     *s = sumf;
 }
